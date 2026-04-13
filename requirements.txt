@@ -1,0 +1,7 @@
+ccxt>=4.0
+hyperliquid-python-sdk>=0.5
+tavily-python>=0.3
+pandas>=2.0
+ta>=0.11
+python-dotenv>=1.0
+anthropic>=0.40
