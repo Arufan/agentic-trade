@@ -41,7 +41,7 @@ Respond in this exact JSON format only:
 
         try:
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="glm-5.1",
                 max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
             )
