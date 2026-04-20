@@ -2,8 +2,15 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from config import settings
 from src.strategy.technical import Signal, analyze_technical
 from src.utils.logger import logger
+
+
+def _apply_slippage(price: float, side_is_buy: bool, slippage_bps: float) -> float:
+    """Apply symmetric slippage — buys pay up, sells take down."""
+    adj = slippage_bps / 10_000.0
+    return price * (1 + adj) if side_is_buy else price * (1 - adj)
 
 
 @dataclass
@@ -45,6 +52,9 @@ def run_backtest(
     min_signal_strength: float = 0.2,
     leverage: float = 20.0,
     use_sentiment: bool = False,
+    fee_bps: float | None = None,
+    slippage_bps: float | None = None,
+    min_signal_strength_live: float | None = None,
 ) -> BacktestResult:
     """Run a backtest on historical OHLCV data using technical + optional sentiment.
 
@@ -60,6 +70,17 @@ def run_backtest(
         use_sentiment: Include Tavily sentiment analysis
     """
     from ta.volatility import AverageTrueRange
+
+    # Resolve fee/slippage from settings if not explicitly passed
+    fee_rate = (fee_bps if fee_bps is not None else settings.FEE_BPS) / 10_000.0
+    slip_bps = slippage_bps if slippage_bps is not None else settings.SLIPPAGE_BPS
+    # Match live entry filter (combined signal threshold = 0.3 -> strength 0.5
+    # after a 0.6 tech-weight), but allow caller to override.
+    min_strength = min_signal_strength_live if min_signal_strength_live is not None else min_signal_strength
+    logger.info(
+        f"Backtest realism: fee_bps={fee_rate*10000:.1f} slip_bps={slip_bps:.1f} "
+        f"min_strength={min_strength}"
+    )
 
     # Sentiment: fetch once for the symbol
     sentiment_data = None
@@ -126,9 +147,14 @@ def run_backtest(
             )
 
             if sl_hit:
-                exit_price = position["stop_loss"]
+                # Market-close at SL, with adverse slippage
+                exit_price = _apply_slippage(
+                    position["stop_loss"],
+                    side_is_buy=(position["side"] == "sell"),
+                    slippage_bps=slip_bps,
+                )
                 raw_pnl = (exit_price - position["entry_price"]) * position["size"] * (1 if position["side"] == "buy" else -1)
-                fee = position["size"] * exit_price * 0.0004 + position["size"] * position["entry_price"] * 0.0004  # 0.04% each side
+                fee = position["size"] * exit_price * fee_rate + position["size"] * position["entry_price"] * fee_rate
                 pnl = raw_pnl - fee
                 balance = position["balance_at_entry"] + pnl
                 trades.append(Trade(
@@ -142,9 +168,14 @@ def run_backtest(
                 position = None
 
             elif tp_hit:
-                exit_price = position["take_profit"]
+                # Limit-close at TP; slight adverse slip still realistic for market fills
+                exit_price = _apply_slippage(
+                    position["take_profit"],
+                    side_is_buy=(position["side"] == "sell"),
+                    slippage_bps=slip_bps * 0.5,
+                )
                 raw_pnl = (exit_price - position["entry_price"]) * position["size"] * (1 if position["side"] == "buy" else -1)
-                fee = position["size"] * exit_price * 0.0004 + position["size"] * position["entry_price"] * 0.0004
+                fee = position["size"] * exit_price * fee_rate + position["size"] * position["entry_price"] * fee_rate
                 pnl = raw_pnl - fee
                 balance = position["balance_at_entry"] + pnl
                 trades.append(Trade(
@@ -178,7 +209,7 @@ def run_backtest(
             if signal.signal == Signal.SELL and sentiment_data.sentiment == Sentiment.BULLISH and sentiment_data.confidence > 0.5:
                 continue  # Skip sell when strong bullish sentiment
 
-        if signal.signal == Signal.HOLD or signal.strength < min_signal_strength:
+        if signal.signal == Signal.HOLD or signal.strength < min_strength:
             continue
 
         # Track equity curve
@@ -187,30 +218,31 @@ def run_backtest(
         if not np.isfinite(current_atr) or current_atr == 0:
             continue
 
-        # Calculate position size (with leverage)
+        # Calculate position size (with leverage), then apply entry slippage
+        entry_price = _apply_slippage(price, side_is_buy=(signal.signal == Signal.BUY), slippage_bps=slip_bps)
         risk_amount = balance * (risk_per_trade_pct / 100)
         sl_distance = current_atr * stop_loss_atr_mult
         size = risk_amount / sl_distance if sl_distance > 0 else 0
-        cost = size * price
+        cost = size * entry_price
         margin_required = cost / leverage
 
         if size <= 0 or margin_required > balance:
             continue
 
-        # Set SL/TP
+        # Set SL/TP off the *slipped* entry so risk math stays honest
         if signal.signal == Signal.BUY:
-            stop_loss = price - sl_distance
-            take_profit = price + (sl_distance * take_profit_rr)
+            stop_loss = entry_price - sl_distance
+            take_profit = entry_price + (sl_distance * take_profit_rr)
             side = "buy"
         else:
-            stop_loss = price + sl_distance
-            take_profit = price - (sl_distance * take_profit_rr)
+            stop_loss = entry_price + sl_distance
+            take_profit = entry_price - (sl_distance * take_profit_rr)
             side = "sell"
 
         margin = cost / leverage
         position = {
             "side": side,
-            "entry_price": price,
+            "entry_price": entry_price,
             "size": size,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
@@ -220,13 +252,14 @@ def run_backtest(
             "margin": margin,
             "leverage": leverage,
         }
-        logger.info(f"  [{timestamp}] OPEN {side.upper()} {symbol} @ {price:.2f} | size={size:.6f} | margin={margin:.2f} | SL={stop_loss:.2f} TP={take_profit:.2f}")
+        logger.info(f"  [{timestamp}] OPEN {side.upper()} {symbol} @ {entry_price:.2f} | size={size:.6f} | margin={margin:.2f} | SL={stop_loss:.2f} TP={take_profit:.2f}")
 
     # Close any open position at end
     if position:
-        exit_price = df.iloc[-1]["close"]
+        raw_exit = df.iloc[-1]["close"]
+        exit_price = _apply_slippage(raw_exit, side_is_buy=(position["side"] == "sell"), slippage_bps=slip_bps)
         raw_pnl = (exit_price - position["entry_price"]) * position["size"] * (1 if position["side"] == "buy" else -1)
-        fee = position["size"] * exit_price * 0.0004 + position["size"] * position["entry_price"] * 0.0004
+        fee = position["size"] * exit_price * fee_rate + position["size"] * position["entry_price"] * fee_rate
         pnl = raw_pnl - fee
         balance = position["balance_at_entry"] + pnl
         trades.append(Trade(

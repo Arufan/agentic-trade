@@ -3,6 +3,11 @@ from config import settings
 from src.utils.logger import logger
 
 
+def _get_journal():
+    from src.utils.trade_journal import journal
+    return journal
+
+
 class TelegramBot:
     """Telegram bot for trade notifications and remote commands."""
 
@@ -20,18 +25,20 @@ class TelegramBot:
         self._get_positions = None  # callable → list
         self._get_trades = None  # callable → list
         self._stop_bot = None  # callable → None
+        self._run_screening = None  # callable → str (returns screening result)
 
         if self.enabled:
             logger.info("Telegram bot enabled")
         else:
             logger.info("Telegram bot disabled")
 
-    def set_callbacks(self, get_balance=None, get_positions=None, get_trades=None, stop_bot=None):
+    def set_callbacks(self, get_balance=None, get_positions=None, get_trades=None, stop_bot=None, run_screening=None):
         """Set callbacks for command handlers to access bot state."""
         self._get_balance = get_balance
         self._get_positions = get_positions
         self._get_trades = get_trades
         self._stop_bot = stop_bot
+        self._run_screening = run_screening
 
     def send_message(self, text: str):
         """Send a message to the Telegram chat."""
@@ -48,18 +55,85 @@ class TelegramBot:
         except Exception as e:
             logger.warning(f"Telegram send failed: {e}")
 
-    def send_trade_alert(self, side: str, symbol: str, price: float, amount: float, sl: float = 0, tp: float = 0):
-        """Send a formatted trade execution alert."""
-        emoji = "🟢" if side == "buy" else "🔴"
+    def send_trade_alert(self, side: str, symbol: str, price: float, amount: float,
+                         sl: float = 0, tp: float = 0, **kwargs):
+        """Send a formatted trade execution alert with detailed analysis."""
+        from datetime import datetime, timezone, timedelta
+
+        confidence = kwargs.get("confidence", 0)
+        reasoning = kwargs.get("reasoning", "")
+        indicators = kwargs.get("indicators", {})
+        sentiment_summary = kwargs.get("sentiment_summary", "")
+        sentiment_val = kwargs.get("sentiment", "neutral")
+        sentiment_conf = kwargs.get("sentiment_confidence", 0)
+        risk_pct = kwargs.get("risk_pct", 0)
+        notional = kwargs.get("notional", 0)
+        atr = indicators.get("atr", 0)
+        rsi = indicators.get("rsi", 0)
+        macd = indicators.get("macd_hist", 0)
+        ema_8 = indicators.get("ema_8", 0)
+        ema_21 = indicators.get("ema_21", 0)
+        ema_55 = indicators.get("ema_55", 0)
+        adx = indicators.get("adx", 0)
+        fvg_signal = indicators.get("fvg_signal", "none")
+
+        direction = "LONG" if side == "buy" else "SHORT"
+        dir_icon = "🟢" if side == "buy" else "🔴"
+
+        # Calculate TP levels based on R:R from entry to SL distance
+        sl_distance = abs(price - sl) if sl else atr * 1.5
+        if sl_distance == 0:
+            sl_distance = price * 0.01
+
+        if side == "buy":
+            tp1 = price + sl_distance * 1.0
+            tp2 = price + sl_distance * 2.0
+            tp3 = price + sl_distance * 3.0
+        else:
+            tp1 = price - sl_distance * 1.0
+            tp2 = price - sl_distance * 2.0
+            tp3 = price - sl_distance * 3.0
+
+        # Technical bias
+        tech_signal = kwargs.get("tech_signal", "hold")
+        tech_strength = kwargs.get("tech_strength", 0)
+        tech_pct = int(tech_strength * 100)
+
+        # Sentiment label
+        sent_emoji = {"bullish": "BULLISH", "bearish": "BEARISH", "neutral": "NETRAL"}.get(sentiment_val, "NETRAL")
+
+        # WIB timezone
+        wib = timezone(timedelta(hours=7))
+        now_wib = datetime.now(wib).strftime("%d %b %Y %H:%M WIB")
+
+        # Build message
         msg = (
-            f"{emoji} <b>{side.upper()} {symbol}</b>\n"
-            f"Price: <code>{price:.2f}</code>\n"
-            f"Size: <code>{amount:.6f}</code>"
+            f"<b>{dir_icon} {direction} {symbol}</b>\n"
+            f"\n"
+            f"Arah: <b>{direction}</b>\n"
+            f"Keyakinan: <b>{confidence:.0%}</b>\n"
+            f"\n"
+            f"📍 Entry: <code>{price:.2f}</code>\n"
+            f"🛑 Stop Loss: <code>{sl:.2f}</code> (1.5 ATR = {atr * 1.5:.2f} pts)\n"
+            f"🎯 Target 1: <code>{tp1:.2f}</code> (1R — 50% ukuran)\n"
+            f"🎯 Target 2: <code>{tp2:.2f}</code> (2R — 30% ukuran)\n"
+            f"🎯 Target 3: <code>{tp3:.2f}</code> (3R — 20% trailing)\n"
+            f"\n"
+            f"📊 <b>ANALISA AGEN:</b>\n"
+            f"• Sentimen: {sent_emoji} ({sentiment_conf:.0%})\n"
+            f"• AI Digest: {reasoning[:150]}\n"
+            f"• Teknikal: {tech_signal.upper()} ({tech_pct}%)\n"
+            f"• RSI: {rsi:.1f} | MACD: {macd:.4f} | ADX: {adx:.1f}\n"
+            f"• EMA 8/21/55: {ema_8:.2f} / {ema_21:.2f} / {ema_55:.2f}\n"
+            f"• FVG: {fvg_signal}\n"
+            f"\n"
+            f"🔍 <b>RINGKASAN SIGNAL:</b>\n"
+            f"• {'Konfirmasi' if confidence >= 0.7 else 'Moderat'} {direction} dengan keyakinan {confidence:.0%}\n"
+            f"• Ukuran posisi: ${notional:.2f} ({amount:.6f})\n"
+            f"\n"
+            f"⚡ Risiko: {risk_pct:.1f}% dari akun\n"
+            f"⏰ Waktu: {now_wib}"
         )
-        if sl:
-            msg += f"\nStop-Loss: <code>{sl:.2f}</code>"
-        if tp:
-            msg += f"\nTake-Profit: <code>{tp:.2f}</code>"
         self.send_message(msg)
 
     def send_error_alert(self, error: str):
@@ -133,6 +207,8 @@ class TelegramBot:
                 "Commands:\n"
                 "/status — Balance & positions\n"
                 "/trades — Recent trades\n"
+                "/history — Trade history & performance\n"
+                "/screening — Run manual screening now\n"
                 "/stop — Stop the bot"
             )
 
@@ -164,6 +240,42 @@ class TelegramBot:
                         self.send_message("\n".join(lines))
                 except Exception as e:
                     self.send_message(f"❌ Failed to get trades: {e}")
+            else:
+                self.send_message("⚠️ Bot not running")
+
+        elif text == "/history":
+            try:
+                j = _get_journal()
+                stats = j.get_stats()
+                trades = j.get_recent_trades(10)
+                lines = [
+                    f"📊 <b>Trade History</b>",
+                    f"Total: {stats['total_trades']} | Open: {stats['open_trades']}",
+                    f"Closed: {stats['closed_trades']} ({stats['wins']}W / {stats['losses']}L)",
+                    f"Win Rate: {stats['win_rate']:.1f}%",
+                    f"Net PnL: {'+'if stats['net_pnl']>=0 else ''}{stats['net_pnl']:.4f} USDT",
+                ]
+                if trades:
+                    lines.append("\n<b>Last trades:</b>")
+                    for t in trades[-10:]:
+                        if t["status"] == "open":
+                            lines.append(f"  📌 {t['side'].upper()} {t['symbol']} @ {t['entry_price']:.2f} (open)")
+                        else:
+                            icon = "✅" if (t.get("pnl") or 0) > 0 else "❌"
+                            pnl_s = f"{'+'if (t.get('pnl') or 0)>0 else ''}{t.get('pnl', 0):.4f}"
+                            lines.append(f"  {icon} {t['side'].upper()} {t['symbol']} @ {t['entry_price']:.2f} → {t.get('exit_price', '?')} | {pnl_s}")
+                self.send_message("\n".join(lines))
+            except Exception as e:
+                self.send_message(f"❌ Failed to get history: {e}")
+
+        elif text == "/screening":
+            if self._run_screening:
+                self.send_message("🔍 <b>Running manual screening...</b>")
+                try:
+                    result = self._run_screening()
+                    self.send_message(result)
+                except Exception as e:
+                    self.send_message(f"❌ Screening failed: {e}")
             else:
                 self.send_message("⚠️ Bot not running")
 

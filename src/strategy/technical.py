@@ -7,6 +7,8 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 
+from src.strategy.fvg import fvg_score
+
 
 class Signal(str, Enum):
     BUY = "buy"
@@ -68,6 +70,9 @@ def analyze_technical(df: pd.DataFrame) -> TechnicalSignal:
 
     current_price = close.iloc[-1]
 
+    # === FVG / IFVG scoring ===
+    fvg_buy, fvg_sell, fvg_meta = fvg_score(df)
+
     indicators = {
         "rsi": round(current_rsi, 2),
         "macd_hist": round(current_macd_hist, 4),
@@ -78,6 +83,11 @@ def analyze_technical(df: pd.DataFrame) -> TechnicalSignal:
         "atr": round(current_atr, 2),
         "vol_ratio": round(vol_ratio, 2),
         "price": round(current_price, 2),
+        "fvg_bullish": fvg_meta["fvg_bullish"],
+        "fvg_bearish": fvg_meta["fvg_bearish"],
+        "ifvg_bullish": fvg_meta["ifvg_bullish"],
+        "ifvg_bearish": fvg_meta["ifvg_bearish"],
+        "fvg_signal": fvg_meta["fvg_signal"],
     }
 
     # === GATE 1: Need some trend (ADX > 20) ===
@@ -132,6 +142,9 @@ def analyze_technical(df: pd.DataFrame) -> TechnicalSignal:
         if plus_di > minus_di and plus_di > 20:
             buy_score += 1
 
+    # FVG/IFVG contribution (works regardless of trend)
+    buy_score += fvg_buy
+
     # === SELL SIGNAL: Downtrend + pullback + reversal confirmation ===
     sell_score = 0
     if downtrend:
@@ -167,14 +180,17 @@ def analyze_technical(df: pd.DataFrame) -> TechnicalSignal:
         if minus_di > plus_di and minus_di > 20:
             sell_score += 1
 
+    # FVG/IFVG contribution (works regardless of trend)
+    sell_score += fvg_sell
+
     # === Determine signal ===
-    threshold = 5
+    threshold = 6
 
     if buy_score >= threshold:
-        strength = min(buy_score / 8.0, 1.0)
+        strength = min(buy_score / 11.0, 1.0)
         return TechnicalSignal(signal=Signal.BUY, strength=strength, indicators=indicators)
     elif sell_score >= threshold:
-        strength = min(sell_score / 8.0, 1.0)
+        strength = min(sell_score / 11.0, 1.0)
         return TechnicalSignal(signal=Signal.SELL, strength=strength, indicators=indicators)
     else:
         return TechnicalSignal(signal=Signal.HOLD, strength=0.0, indicators=indicators)

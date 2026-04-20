@@ -24,8 +24,6 @@ class OrderExecutor:
                 price=price,
             )
             self._order_history.append(order)
-            fill_price = order.price or price or 0
-            telegram.send_trade_alert(action, symbol, fill_price, amount, sl=sl, tp=tp)
             return order
         except Exception as e:
             logger.error(f"Order execution failed: {e}")
