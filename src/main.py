@@ -659,6 +659,20 @@ def cmd_run(args):
                 # normalizes strings, but pinning the enum at the boundary is
                 # the correct contract. See test_hyperliquid_side_norm.py.
                 side_enum = OrderSide.BUY if trade_action == "buy" else OrderSide.SELL
+
+                # --dry-run short-circuit: log the would-be order and skip.
+                # This is the smoke-test escape hatch documented in LIVE_TEST.md.
+                # NEVER drop this branch without also removing the flag.
+                if getattr(args, "dry_run", False):
+                    rejection_stats[symbol]["dry_run_skipped"] += 1
+                    logger.info(
+                        f"  [{symbol}] DRY-RUN — would {trade_action.upper()} "
+                        f"amount={amount:.6f} @ {entry_price:.2f} "
+                        f"SL={sl:.2f} TP={tp:.2f} notional={notional:.2f} "
+                        f"risk={risk_pct:.2f}%"
+                    )
+                    continue
+
                 try:
                     entry_order, _, _ = exchange.place_order_with_sl_tp(
                         symbol, side_enum, amount, entry_price, sl, tp,
@@ -1010,14 +1024,33 @@ def main():
     # run command
     run_parser = subparsers.add_parser("run", help="Start the trading bot (live loop)")
     run_parser.add_argument(
+        "--exchange",
+        default=settings.DEFAULT_EXCHANGE,
+        choices=["binance", "hyperliquid"],
+        help="Exchange to trade on (default from settings.DEFAULT_EXCHANGE)",
+    )
+    run_parser.add_argument(
+        "--timeframe", default="1h",
+        help="Candle timeframe for analysis (1m, 5m, 15m, 1h, 4h, 1d)",
+    )
+    run_parser.add_argument(
+        "--interval", type=int, default=300,
+        help="Seconds between analysis cycles (default 300 = 5 min)",
+    )
+    run_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Skip order placement — log decisions only",
+        help="Skip order placement — log decisions only (safe smoke test)",
     )
     run_parser.set_defaults(func=cmd_run)
 
     # status command
     status_parser = subparsers.add_parser("status", help="Show positions and balance")
+    status_parser.add_argument(
+        "--exchange",
+        default=settings.DEFAULT_EXCHANGE,
+        choices=["binance", "hyperliquid"],
+    )
     status_parser.set_defaults(func=cmd_status)
 
     # backtest command
