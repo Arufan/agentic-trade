@@ -22,6 +22,14 @@ class Settings:
     TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
     TAVILY_API_KEY_BACKUP: str = os.getenv("TAVILY_API_KEY_BACKUP", "")
 
+    # Tavily budget guardrails — the free plan ships 2000 credits/month.
+    # TTL caches repeat queries (default 90 min / 5400s); circuit breaker
+    # stops calling Tavily when monthly usage >= circuit threshold
+    # (default 1800 to leave 10% headroom).
+    TAVILY_TTL_SECONDS: int = int(os.getenv("TAVILY_TTL_SECONDS", "5400"))
+    TAVILY_MONTHLY_BUDGET: int = int(os.getenv("TAVILY_MONTHLY_BUDGET", "2000"))
+    TAVILY_CIRCUIT_THRESHOLD: int = int(os.getenv("TAVILY_CIRCUIT_THRESHOLD", "1800"))
+
     # Trading
     TRADING_PAIRS: list[str] = os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT").split(",")
     DEFAULT_EXCHANGE: str = os.getenv("DEFAULT_EXCHANGE", "binance")
@@ -29,6 +37,27 @@ class Settings:
     MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "10.0"))
     MAX_TOTAL_EXPOSURE: float = float(os.getenv("MAX_TOTAL_EXPOSURE", "0.5"))
     MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.7"))
+    # AI veto threshold: AI can only override a tradable combined signal
+    # (HOLD or opposite direction) when its own confidence is at least this
+    # high. Prevents low-confidence AI HOLDs from silently eating strong
+    # technical setups. Raise to tighten (more AI influence), lower to
+    # loosen. Setting to 1.0 effectively disables AI veto.
+    AI_VETO_MIN_CONFIDENCE: float = float(os.getenv("AI_VETO_MIN_CONFIDENCE", "0.80"))
+
+    # Key-levels engine: weight applied to the bias_score (bounded -1..+1)
+    # contributed by higher-TF pivots (quarterly mid, weekly H/M/L, Monday
+    # bar, daily open, etc.). Kept modest — levels confirm trades, they
+    # don't drive them. Set to 0 to disable.
+    LEVELS_ENABLED: bool = os.getenv("LEVELS_ENABLED", "true").lower() == "true"
+    LEVELS_WEIGHT: float = float(os.getenv("LEVELS_WEIGHT", "0.10"))
+    LEVELS_DAILY_HISTORY: int = int(os.getenv("LEVELS_DAILY_HISTORY", "200"))
+
+    # Chop / mean-reversion engine — activates only in sideways regimes
+    # when the trend-follower is HOLDing. Sizing uses CHOP_SIZE_MULT (0.5×
+    # by default) to keep chop risk well below trend risk.
+    CHOP_ENABLED: bool = os.getenv("CHOP_ENABLED", "true").lower() == "true"
+    CHOP_MIN_STRENGTH: float = float(os.getenv("CHOP_MIN_STRENGTH", "0.55"))
+    CHOP_SIZE_MULT: float = float(os.getenv("CHOP_SIZE_MULT", "0.5"))
     MAX_POSITIONS: int = int(os.getenv("MAX_POSITIONS", "2"))
     MAX_SAME_DIRECTION: int = int(os.getenv("MAX_SAME_DIRECTION", "2"))
     MAX_TRADE_SIZE_USDT: float = float(os.getenv("MAX_TRADE_SIZE_USDT", "50.0"))
@@ -89,6 +118,50 @@ class Settings:
     TELEGRAM_ENABLED: bool = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    # Cycle digest cadence — a compact per-N-cycles rollup (executed,
+    # rejected, rejection breakdown, Tavily budget). Default 12 cycles
+    # ≈ once per hour at 5-minute intervals. Set 0 to disable digests.
+    TELEGRAM_DIGEST_INTERVAL_CYCLES: int = int(os.getenv("TELEGRAM_DIGEST_INTERVAL_CYCLES", "12"))
+    # Per-symbol HOLD alerts are very noisy; off by default. Useful to
+    # flip ON for a day or two during knob tuning, then off again.
+    TELEGRAM_HOLD_ALERT_ENABLED: bool = os.getenv("TELEGRAM_HOLD_ALERT_ENABLED", "false").lower() == "true"
+
+    # ------------------------------------------------------------------ #
+    # Phase 9: Economic calendar awareness
+    # ------------------------------------------------------------------ #
+    # Dual-source weekly calendar (ForexFactory JSON -> Firecrawl fallback).
+    # Refreshed once per ECON_CALENDAR_REFRESH_HOURS, cached on disk.
+    # Triggers:
+    #   * hard blackout ECON_BLACKOUT_MIN minutes before any matching event
+    #     (rejection reason="event_blackout" - no new entries).
+    #   * size modifier x ECON_EVENT_SIZE_MULT for plus/minus ECON_EVENT_WINDOW_H
+    #     around the event so we stay tiny when the tape whips.
+    # Match filter: ECON_TRACK_CURRENCIES (comma-separated) intersected
+    # with ECON_TRACK_IMPACT (comma-separated) AND the whitelisted title
+    # keywords (FOMC, CPI, NFP, PCE, PPI, GDP, Retail Sales, ISM...).
+    # Firecrawl fallback activates when direct HTTP to faireconomy fails
+    # (ISP/corp block) OR when ECON_PREFER_FIRECRAWL=true.
+    ECON_CALENDAR_ENABLED: bool = os.getenv("ECON_CALENDAR_ENABLED", "true").lower() == "true"
+    ECON_CALENDAR_REFRESH_HOURS: int = int(os.getenv("ECON_CALENDAR_REFRESH_HOURS", "24"))
+    ECON_BLACKOUT_MIN: int = int(os.getenv("ECON_BLACKOUT_MIN", "30"))
+    ECON_EVENT_WINDOW_H: float = float(os.getenv("ECON_EVENT_WINDOW_H", "2.0"))
+    ECON_EVENT_SIZE_MULT: float = float(os.getenv("ECON_EVENT_SIZE_MULT", "0.5"))
+    ECON_TRACK_CURRENCIES: list = [
+        c.strip().upper()
+        for c in os.getenv("ECON_TRACK_CURRENCIES", "USD").split(",")
+        if c.strip()
+    ]
+    ECON_TRACK_IMPACT: list = [
+        i.strip().title()
+        for i in os.getenv("ECON_TRACK_IMPACT", "High").split(",")
+        if i.strip()
+    ]
+    ECON_PREFER_FIRECRAWL: bool = os.getenv("ECON_PREFER_FIRECRAWL", "false").lower() == "true"
+    FIRECRAWL_API_KEY: str = os.getenv("FIRECRAWL_API_KEY", "")
+    # Warn on Telegram when a matching event is within this many hours
+    # ahead (default 2h - matches the size-reduction window). Each
+    # event is warned-about once per boot; restart the bot to re-arm.
+    ECON_EVENT_WARN_AHEAD_H: float = float(os.getenv("ECON_EVENT_WARN_AHEAD_H", "2.0"))
 
 
 settings = Settings()

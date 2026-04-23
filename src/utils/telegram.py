@@ -140,6 +140,118 @@ class TelegramBot:
         """Send an error/critical alert."""
         self.send_message(f"⚠️ <b>Error:</b>\n<code>{error}</code>")
 
+    def send_cycle_digest(self, cycle_num: int, executed: int, rejected: int,
+                          rejection_breakdown: dict, pairs: list[str],
+                          budget_snapshot: dict | None = None):
+        """Send a compact digest of the last N cycles.
+
+        Used for periodic observability — covers executed/rejected counts,
+        rejection-reason breakdown, and Tavily budget state. Called from
+        the live loop every TELEGRAM_DIGEST_INTERVAL_CYCLES cycles.
+        """
+        lines = [
+            f"📊 <b>Cycle Digest #{cycle_num}</b>",
+            f"Pairs: <code>{', '.join(pairs)}</code>",
+            f"Executed: <b>{executed}</b> | Rejected: <b>{rejected}</b>",
+        ]
+        if rejection_breakdown:
+            lines.append("")
+            lines.append("<b>Rejection breakdown:</b>")
+            for reason, count in sorted(rejection_breakdown.items(), key=lambda x: -x[1]):
+                lines.append(f"  • {reason}: {count}")
+        if budget_snapshot:
+            used = budget_snapshot.get("used", 0)
+            threshold = budget_snapshot.get("threshold", 0)
+            remaining = budget_snapshot.get("remaining", 0)
+            month = budget_snapshot.get("month", "?")
+            lines.append("")
+            lines.append(
+                f"💰 Tavily [{month}]: {used}/{threshold} used "
+                f"({remaining} left)"
+            )
+        self.send_message("\n".join(lines))
+
+    def send_position_close(self, symbol: str, side: str, entry_price: float,
+                            exit_price: float, pnl: float, amount: float,
+                            duration_s: float | None = None,
+                            reason: str = "closed"):
+        """Send an immediate alert when a position is closed.
+
+        Called from the journal-reconciliation step once a detected close
+        is confirmed. Includes PnL, duration, and the inferred close reason
+        (SL hit / TP hit / manual / trailing) when available.
+        """
+        from datetime import timedelta
+        pnl_icon = "✅" if pnl > 0 else ("❌" if pnl < 0 else "⚪")
+        pnl_sign = "+" if pnl >= 0 else ""
+        direction = "LONG" if side == "buy" else "SHORT"
+        move_pct = 0.0
+        if entry_price > 0:
+            if side == "buy":
+                move_pct = (exit_price - entry_price) / entry_price * 100
+            else:
+                move_pct = (entry_price - exit_price) / entry_price * 100
+
+        duration_part = ""
+        if duration_s is not None and duration_s > 0:
+            td = timedelta(seconds=int(duration_s))
+            duration_part = f"\n⏱ Duration: {td}"
+
+        msg = (
+            f"{pnl_icon} <b>Position Closed</b> ({reason})\n"
+            f"{direction} <b>{symbol}</b>\n"
+            f"\n"
+            f"Entry: <code>{entry_price:.4f}</code>\n"
+            f"Exit:  <code>{exit_price:.4f}</code>\n"
+            f"Move:  <b>{pnl_sign}{move_pct:.2f}%</b>\n"
+            f"PnL:   <b>{pnl_sign}{pnl:.4f}</b> USDC\n"
+            f"Size:  <code>{amount:.6f}</code>"
+            f"{duration_part}"
+        )
+        self.send_message(msg)
+
+    def send_hold_notice(self, symbol: str, reason: str,
+                         signal_action: str, signal_conf: float,
+                         ai_action: str, ai_conf: float):
+        """Optional 'why we held' note (off by default, noisy).
+
+        Guarded by TELEGRAM_HOLD_ALERT_ENABLED. Useful in the first few
+        days of a new strategy-knob tuning cycle to observe what's
+        getting filtered, then disable.
+        """
+        if not bool(getattr(settings, "TELEGRAM_HOLD_ALERT_ENABLED", False)):
+            return
+        self.send_message(
+            f"⏸ <b>HOLD</b> {symbol}: {reason}\n"
+            f"  Signal: {signal_action} ({signal_conf:.0%})\n"
+            f"  AI: {ai_action} ({ai_conf:.0%})"
+        )
+
+    def send_event_warning(self, currency: str, title: str, impact: str,
+                           minutes_ahead: float, blackout_min: int = 0,
+                           size_mult: float = 1.0, window_h: float = 0.0):
+        """Heads-up alert when a high-impact macro event is approaching.
+
+        Typically fired once per event (caller dedupes with last_warned_id).
+        Operators use this to size-down manually ahead of the auto-gate
+        kicking in, or to watch the tape during FOMC/CPI prints.
+        """
+        when = (
+            f"{minutes_ahead:.0f} min"
+            if minutes_ahead < 120
+            else f"{minutes_ahead / 60.0:.1f} h"
+        )
+        parts = [
+            f"📅 <b>Macro Event Incoming</b>",
+            f"<b>{currency} {title}</b> ({impact})",
+            f"in <code>{when}</code>",
+        ]
+        if blackout_min > 0:
+            parts.append(f"• Blackout: no new entries within T-{blackout_min} min")
+        if size_mult < 1.0 and window_h > 0:
+            parts.append(f"• Size ×{size_mult:.2f} for ±{window_h:.1f}h")
+        self.send_message("\n".join(parts))
+
     def send_pnl_report(self, balance: dict, positions: list):
         """Send a balance and position report."""
         lines = [

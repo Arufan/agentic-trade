@@ -70,40 +70,54 @@ minimal 2x berturut-turut.
 
 ---
 
-## Schedule via Windows Task Scheduler
+## Scheduling: Daemon vs Task Scheduler
 
-### Setup task
+Dua cara run bot terus-menerus. Pilih salah satu:
 
-1. Buka **Task Scheduler** (Win + R → `taskschd.msc`)
-2. **Create Task** (bukan Create Basic Task)
-3. **General tab:**
-   - Name: `agentic-trade-cycle`
-   - ☑ Run whether user is logged on or not
-   - ☑ Run with highest privileges
-4. **Triggers tab:** New →
-   - Daily, recur every 1 day
-   - ☑ Repeat every **5 minutes** for duration of **1 day**
-   - ☑ Enabled
-5. **Actions tab:** New →
-   - Action: Start a program
-   - Program/script: `C:\Users\aruru\agentic-trade\run-live.bat`
-   - Start in: `C:\Users\aruru\agentic-trade`
-6. **Conditions tab:**
-   - ☐ Start only if AC (uncheck — biar tetap jalan di battery)
-   - ☑ Wake the computer to run this task (kalau komputer sering sleep)
-7. **Settings tab:**
-   - ☑ Allow task to be run on demand
-   - If running, do not start a new instance
-   - Stop task if runs longer than **4 minutes** (kalau stuck, kill sebelum next cycle)
+### Opsi A — Daemon dengan auto-restart (recommended)
 
-### Test task manually
+Satu proses persistent, loop internal tiap 5 menit. Wrapper batch
+auto-restart kalau crash. Lebih efisien (WebSocket nggak reconnect tiap cycle).
 
-Right-click task → Run. Expected:
-- `data\runner.log` ter-append dengan `=== cycle start ===` dan `=== cycle end (exit 0) ===`
-- Telegram dapet notifikasi (kalau ada signal)
-- `data\trades.json` update kalau ada trade
+```
+run-live-daemon.bat
+```
 
-Kalau exit code ≠ 0 → buka `data\runner.log` tail 200 lines, debug dulu.
+Atau minimize background:
+```
+start "agentic-trade" /min run-live-daemon.bat
+```
+
+Auto-start saat Windows login (opsional, buat resilient terhadap reboot):
+1. Task Scheduler → **Create Task** → name `agentic-trade-daemon`
+2. **Triggers:** At log on
+3. **Actions:** Program `C:\Users\aruru\agentic-trade\run-live-daemon.bat`,
+   Start in `C:\Users\aruru\agentic-trade`
+4. **Conditions:** uncheck "Start only if AC"
+5. **Settings:** uncheck "Stop task if runs longer than..." (daemon persistent)
+
+Log di `data\daemon.log`. Stop: Ctrl-C di window, atau close window.
+
+**Caveat:** kalau MAX_DRAWDOWN trip → process exit → daemon restart 30s kemudian,
+tapi akan exit lagi karena peak_balance belum reset. Kalau kena kill-switch:
+stop daemon → reset state (lihat Troubleshooting) → start lagi.
+
+### Opsi B — Task Scheduler polling (lebih robust, sedikit overhead)
+
+Fresh process tiap 5 menit. Tahan crash, tahan reboot, zero memory leak.
+Cocok kalau komputer sering sleep/wake.
+
+1. **Task Scheduler** (Win + R → `taskschd.msc`)
+2. **Create Task** → **General:** name `agentic-trade-cycle`, ☑ Run with highest privileges
+3. **Triggers:** Daily, recur 1 day, ☑ Repeat every **5 minutes** for **1 day**
+4. **Actions:** Program `C:\Users\aruru\agentic-trade\run-live.bat`,
+   Start in `C:\Users\aruru\agentic-trade`
+5. **Conditions:** ☐ Start only if AC, ☑ Wake computer to run
+6. **Settings:** ☑ Run on demand, "Do not start new instance" kalau masih jalan,
+   Stop if runs > **4 minutes**
+
+Test: right-click task → Run. Cek `data\runner.log` ter-append
+`=== cycle start/end (exit 0) ===`.
 
 ---
 
@@ -158,6 +172,89 @@ print(f"Trades: {len(trades)} | WR: {wins/len(trades):.1%} | Net: ${sum(pnls):.2
 | MIN_TRADE_SIZE gate | Balance < $10 | Skip cycle, sleep 5 min |
 | Cluster cap (1) | 1 pos di L1_MAJOR | Block kedua BTC/ETH trade |
 | Funding skip (60% annual) | Extreme funding | Skip entry, log reason |
+| AI veto (conf ≥ 0.80) | AI HOLD/opposite at high conf | Reject trade, log `ai_veto_hold/opposite` |
+| Tavily circuit (1800/2000) | Monthly cap near | Skip news fetch, sentiment falls back to keyword |
+| Econ event blackout (T-30m) | High-impact USD event ≤ 30 min away | Reject new entries, log `event_blackout` |
+| Econ event size-cut (±2h) | High-impact USD event ±2h window | Notional × 0.5 (open trades still managed) |
+
+### Rejection telemetry (Phase 1-6 output)
+
+Setiap cycle sekarang log kenapa trade di-reject — nggak ada lagi silent
+"hold → 0 orders". Cek `bot.log` untuk pola:
+
+```
+[BTC/USDC] REJECT=signal_hold — combined=hold tech=buy(str=0.42) sent=bullish regime=sideways
+[ETH/USDC] REJECT=low_confidence — signal_conf=0.55 < min=0.72
+[HYPE/USDC] REJECT=ai_veto_hold — AI HOLD at conf=0.83 >= veto_threshold=0.80
+=== Cycle summary: executed=1 rejected=2 pairs=3 ===
+  Rejection breakdown: ai_veto_hold=1, low_confidence=1
+```
+
+Rejection reasons yang mungkin muncul:
+- `signal_hold` — combined blend tidak tradable (too weak direction)
+- `low_confidence` — combined conf < MIN_CONFIDENCE
+- `ai_veto_hold` / `ai_veto_opposite` — AI override at high conf
+- `risk_blocked` — pre-trade risk check (exposure, cluster cap, etc.)
+- `sizing_zero` — sizing modifiers collapsed notional to 0
+- `funding_skip` — funding extreme adverse
+- `event_blackout` — high-impact USD macro event within T-30 min (Phase 9)
+- `order_exception` / `order_failed` — exchange rejected order
+
+### Telegram verbosity knobs (Phase 6)
+
+`TELEGRAM_DIGEST_INTERVAL_CYCLES=12` → rolling digest tiap ~1 jam berisi
+executed/rejected counts, rejection breakdown, Tavily budget remaining.
+Set 0 untuk mute digest, still dapat trade/close alerts.
+
+`TELEGRAM_HOLD_ALERT_ENABLED=false` → kalau `true`, tiap rejected symbol
+dapet own Telegram message. Noisy banget — hanya flip ON 1-2 hari saat
+lagi tuning MIN_CONFIDENCE/AI_VETO_MIN_CONFIDENCE, lalu off lagi.
+
+### Economic calendar awareness (Phase 9)
+
+Bot sekarang sadar FOMC / CPI / NFP / PCE / PPI / GDP / Retail Sales / ISM.
+Sekali per 24 jam narik `ff_calendar_thisweek.json` dari ForexFactory
+(gratis, no key) dan cache ke `data/econ_calendar.json`.
+
+Dua efek pada $40 live-test:
+
+1. **Hard blackout T-30 menit** — pas ada event USD HIGH dalam 30 menit
+   ke depan, semua entry baru di-reject dengan reason `event_blackout`.
+   Trailing stop / SL / TP posisi yang udah open **tetap jalan**; bot
+   cuma nggak buka baru di window yang spread-nya lagi 5-10× normal.
+2. **Size modifier ±2 jam** — dalam ±2 jam window dari event yang sama,
+   notional dikali `ECON_EVENT_SIZE_MULT` (default 0.5). Jadi misal
+   30 menit setelah CPI baru keluar, tech signal kuat masuk — bot boleh
+   trade, tapi size-nya setengah. Whipsaw post-print nggak akan ngabisin
+   akun kecil.
+
+Firecrawl fallback tersedia kalau direct HTTP ke faireconomy di-block
+(ISP / corp firewall). Isi `FIRECRAWL_API_KEY` di `.env` — <1 credit/hari
+di refresh 24h, basically free dari kuota 500/bulan.
+
+Knob ringkas:
+- `ECON_CALENDAR_ENABLED=true` — master switch
+- `ECON_BLACKOUT_MIN=30` — blackout window (menit sebelum event)
+- `ECON_EVENT_WINDOW_H=2.0` — size-modifier window (±jam)
+- `ECON_EVENT_SIZE_MULT=0.5` — multiplier dalam window
+- `ECON_TRACK_CURRENCIES=USD` — kalau mau tambah EUR, bikin comma-list
+- `ECON_TRACK_IMPACT=High` — bisa ditambah Medium kalau mau paranoid
+- `ECON_EVENT_WARN_AHEAD_H=2.0` — Telegram heads-up T-2 jam per event
+
+Telegram akan kirim **📅 Macro Event Incoming** saat event matching masuk
+`ECON_EVENT_WARN_AHEAD_H` jam ke depan (dedup per-boot; restart untuk
+re-arm warning yang sama). Cek juga log `bot.log`:
+
+```
+Econ calendar loaded: 28 events (source=faireconomy_json)
+Econ event ahead: USD FOMC Rate Decision (High) — in 1.6h
+[BTC/USDC] REJECT=event_blackout — USD FOMC Rate Decision @ 2026-04-23T18:00:00+00:00
+[ETH/USDC] event sizing x0.50 (USD Core CPI m/m)
+```
+
+Kalau pengen disable sepenuhnya (e.g. lagi backtest kondisi equilibrium):
+set `ECON_CALENDAR_ENABLED=false` — semua kode calendar di-skip, gate
+balik ke Phase 1-6 behavior.
 
 ### Manual abort criteria
 

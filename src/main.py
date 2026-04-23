@@ -1,6 +1,7 @@
 import argparse
 import sys
 import time
+from collections import defaultdict
 
 from config import settings
 from src.data.market import fetch_ohlcv_df
@@ -10,6 +11,8 @@ from src.ai.agent import AIAgent
 from src.execution.order import OrderExecutor
 from src.execution.risk import RiskManager
 from src.execution.trailing import TrailingStopManager
+from src.execution.gate import evaluate_entry_gate, evaluate_event_gate
+from src.exchanges.base import OrderSide
 from src.exchanges.binance import BinanceExchange
 from src.exchanges.hyperliquid import HyperliquidExchange
 from src.utils.logger import logger
@@ -18,6 +21,7 @@ from src.utils.trade_journal import journal
 from src.strategy.regime import fetch_macro_data, detect_ai_regime, AiRegimeResult, Bias
 from src.strategy.funding import evaluate_funding
 from src.strategy.alpha import AlphaEngine
+from src.strategy.levels import compute_key_levels
 from src.data.market_state import get_store as get_market_state_store
 
 
@@ -119,8 +123,36 @@ def cmd_run(args):
 
     logger.info(f"Starting bot on {args.exchange} with pairs: {settings.TRADING_PAIRS}")
 
+    # Cycle counter drives the Telegram digest cadence
+    # (TELEGRAM_DIGEST_INTERVAL_CYCLES). Starts at 0 so cycle #1 is the
+    # first complete loop.
+    cycle_counter = 0
+
+    # === Phase 9: Economic calendar bootstrap ===
+    # Load once at boot from cache OR refresh from faireconomy JSON /
+    # Firecrawl fallback. Missing/stale cache is fine — loader handles
+    # that by fetching. Non-fatal: any error here leaves calendar_snapshot
+    # empty and the gate falls through to "allowed".
+    calendar_snapshot = None
+    warned_event_ids: set[str] = set()  # dedup cross-cycle event warnings
+    if getattr(settings, "ECON_CALENDAR_ENABLED", False):
+        try:
+            from src.strategy.econ_calendar import load_or_refresh as _cal_load
+            calendar_snapshot = _cal_load(
+                firecrawl_key=getattr(settings, "FIRECRAWL_API_KEY", ""),
+                refresh_hours=int(settings.ECON_CALENDAR_REFRESH_HOURS),
+                prefer_firecrawl=bool(settings.ECON_PREFER_FIRECRAWL),
+            )
+            n = len(calendar_snapshot.events) if calendar_snapshot else 0
+            src = calendar_snapshot.source if calendar_snapshot else "none"
+            logger.info(f"Econ calendar loaded: {n} events (source={src})")
+        except Exception as e:
+            logger.warning(f"Econ calendar bootstrap failed: {e}")
+            calendar_snapshot = None
+
     try:
         while True:
+            cycle_counter += 1
             # Early-exit: if balance is below the minimum trade size, there is
             # nothing to trade. Sleep instead of burning LLM/Tavily calls.
             try:
@@ -155,11 +187,50 @@ def cmd_run(args):
                         else:
                             pnl = (entry - exit_price) * amount
                         journal.close_trade(t["id"], exit_price, pnl)
-                        telegram.send_message(
-                            f"Position Closed\n"
-                            f"{t['side'].upper()} {t['symbol']}\n"
-                            f"Entry: {entry:.2f} -> Exit: {exit_price:.2f}\n"
-                            f"PnL: {'+'if pnl>=0 else ''}{pnl:.4f} USDT"
+
+                        # Compute trade duration from journal timestamp
+                        # (ISO8601 with tz). Non-fatal if parsing fails.
+                        duration_s = None
+                        try:
+                            from datetime import datetime, timezone
+                            opened_at = t.get("opened_at") or t.get("timestamp")
+                            if opened_at:
+                                ts = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                duration_s = (datetime.now(timezone.utc) - ts).total_seconds()
+                        except Exception:
+                            pass
+
+                        # Infer close reason: if price crossed the stored SL
+                        # we call it "stop_loss"; likewise for TP. Otherwise
+                        # it was a manual/external close.
+                        close_reason = "closed"
+                        try:
+                            sl_stored = t.get("sl") or 0
+                            tp_stored = t.get("tp") or 0
+                            if t["side"] == "buy":
+                                if sl_stored and exit_price <= sl_stored:
+                                    close_reason = "stop_loss"
+                                elif tp_stored and exit_price >= tp_stored:
+                                    close_reason = "take_profit"
+                            else:
+                                if sl_stored and exit_price >= sl_stored:
+                                    close_reason = "stop_loss"
+                                elif tp_stored and exit_price <= tp_stored:
+                                    close_reason = "take_profit"
+                        except Exception:
+                            pass
+
+                        telegram.send_position_close(
+                            symbol=t["symbol"],
+                            side=t["side"],
+                            entry_price=float(entry),
+                            exit_price=float(exit_price),
+                            pnl=float(pnl),
+                            amount=float(amount),
+                            duration_s=duration_s,
+                            reason=close_reason,
                         )
                     except Exception as e:
                         logger.warning(f"Failed to close journal entry {t['id']}: {e}")
@@ -217,6 +288,62 @@ def cmd_run(args):
             except Exception as e:
                 logger.warning(f"AI macro regime failed: {e}")
 
+            # Per-cycle observability: count every rejection reason so we can
+            # see WHY trades are not happening. Previously the 294-line gate
+            # was silent on rejection → 8k+ "hold" / 0 "order" with no way to
+            # tell which gate was eating signals. Dumped at cycle end.
+            rejection_stats: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            executed_count = 0
+
+            # === Econ calendar per-cycle refresh + T-2h warning ===
+            # load_or_refresh is cheap when cache is fresh (< refresh_hours
+            # old): just reads the JSON file. When stale, it hits network
+            # and either returns the new snapshot or — on failure — the
+            # stale cache. Wrapped defensively: calendar is advisory, not
+            # load-bearing, so any exception here must not stop trading.
+            if getattr(settings, "ECON_CALENDAR_ENABLED", False):
+                try:
+                    from src.strategy.econ_calendar import (
+                        load_or_refresh as _cal_load,
+                        next_event as _cal_next,
+                        format_event_for_log as _cal_fmt,
+                    )
+                    calendar_snapshot = _cal_load(
+                        firecrawl_key=getattr(settings, "FIRECRAWL_API_KEY", ""),
+                        refresh_hours=int(settings.ECON_CALENDAR_REFRESH_HOURS),
+                        prefer_firecrawl=bool(settings.ECON_PREFER_FIRECRAWL),
+                    )
+                    if calendar_snapshot and calendar_snapshot.events:
+                        from datetime import datetime as _dt, timezone as _tz
+                        _now = _dt.now(_tz.utc)
+                        warn_ahead = float(
+                            getattr(settings, "ECON_EVENT_WARN_AHEAD_H", 2.0)
+                        )
+                        ev = _cal_next(
+                            _now, calendar_snapshot.events,
+                            currencies=settings.ECON_TRACK_CURRENCIES,
+                            impacts=settings.ECON_TRACK_IMPACT,
+                            within_hours=warn_ahead,
+                        )
+                        if ev is not None:
+                            ev_id = f"{ev.currency}|{ev.title}|{ev.timestamp_utc.isoformat()}"
+                            if ev_id not in warned_event_ids:
+                                warned_event_ids.add(ev_id)
+                                mins_ahead = (ev.timestamp_utc - _now).total_seconds() / 60.0
+                                logger.info(f"Econ event ahead: {_cal_fmt(ev, _now)}")
+                                try:
+                                    telegram.send_event_warning(
+                                        currency=ev.currency, title=ev.title,
+                                        impact=ev.impact, minutes_ahead=mins_ahead,
+                                        blackout_min=int(settings.ECON_BLACKOUT_MIN),
+                                        size_mult=float(settings.ECON_EVENT_SIZE_MULT),
+                                        window_h=float(settings.ECON_EVENT_WINDOW_H),
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"event warning push failed: {e}")
+                except Exception as e:
+                    logger.warning(f"Calendar refresh failed (non-fatal): {e}")
+
             for symbol in settings.TRADING_PAIRS:
                 symbol = symbol.strip()
 
@@ -255,10 +382,27 @@ def cmd_run(args):
                 except Exception as e:
                     logger.warning(f"Alpha engine failed for {symbol}: {e}")
 
-                # Generate combined signal (4H regime + 1H execution + AI macro + alpha)
+                # Fetch daily history for the key-levels engine — only once
+                # per symbol per cycle, since pivots only shift on daily bar
+                # close. Failure is non-fatal: the blend degrades gracefully.
+                levels_result = None
+                if getattr(settings, "LEVELS_ENABLED", True):
+                    try:
+                        daily_limit = int(getattr(settings, "LEVELS_DAILY_HISTORY", 200))
+                        df_daily = fetch_ohlcv_df(exchange, symbol, timeframe="1d", limit=daily_limit)
+                        if df_daily is not None and not df_daily.empty:
+                            current_px = float(df["close"].iloc[-1])
+                            levels_result = compute_key_levels(
+                                df_daily, current_price=current_px, symbol=symbol,
+                            )
+                            logger.info(f"  Levels {symbol}: {levels_result.reasoning}")
+                    except Exception as e:
+                        logger.warning(f"Key-levels failed for {symbol}: {e}")
+
+                # Generate combined signal (4H regime + 1H execution + AI macro + alpha + levels)
                 signal = generate_signal(
                     df, symbol, df_regime=df_regime, ai_regime=ai_regime,
-                    alpha=alpha_result,
+                    alpha=alpha_result, levels=levels_result,
                 )
 
                 # Check balance and risk
@@ -279,127 +423,367 @@ def cmd_run(args):
                     telegram.send_error_alert(f"Daily-loss kill-switch: {daily_reason}")
                     continue
 
-                # AI final decision (with trade history context)
+                # === EXECUTION GATE ===
+                # Combined signal (tech × sentiment × alpha × regime) is the
+                # PRIMARY direction/confidence source. AI is advisory — it can
+                # veto only when highly confident (≥ AI_VETO_MIN_CONFIDENCE,
+                # default 0.80). Rationale: live-test showed 358 buy/sell
+                # signals vs 0 orders over 24h because AI HOLD was silently
+                # overriding strong tech blends. That was wrong by design.
+                signal_action = signal.action.value          # "buy"/"sell"/"hold"
+                signal_conf = float(signal.confidence)
+
                 decision = ai_agent.decide(signal, symbol, balance, history_summary=history_summary)
-                logger.info(f"AI Decision for {symbol}: {decision['action']} (confidence: {decision.get('confidence', 0)})")
-                logger.info(f"  Reasoning: {decision.get('reasoning', 'N/A')}")
+                ai_action = decision["action"]
+                ai_conf = float(decision.get("confidence", 0))
+                logger.info(
+                    f"[{symbol}] Signal={signal_action}(conf={signal_conf:.2f}) "
+                    f"AI={ai_action}(conf={ai_conf:.2f})"
+                )
+                logger.info(f"  AI reasoning: {decision.get('reasoning', 'N/A')}")
 
                 # Log regime state
                 regime = signal.regime
                 blended = signal.blended_regime
-                logger.info(f"  Regime: {regime.regime.value} (score={regime.score:.2f}) | Blended: {blended.regime.value} AI={blended.ai_regime}")
+                logger.info(
+                    f"  Regime: {regime.regime.value} (score={regime.score:.2f}) | "
+                    f"Blended: {blended.regime.value} AI={blended.ai_regime}"
+                )
 
-                # Execute if confidence threshold met + risk checks pass
-                if decision["action"] in ("buy", "sell") and decision.get("confidence", 0) >= min_confidence:
-                    entry_price = df["close"].iloc[-1]
-                    atr = signal.technical.indicators.get("atr", 0)
-
-                    # Volatility-targeting sizing (preferred) with ATR fallback.
-                    # Vol-target keeps expected daily P&L roughly constant across
-                    # symbols; ATR sizing is kept as a graceful fallback.
-                    notional = 0.0
-                    if settings.VOL_TARGET_ENABLED:
-                        bars_per_day = {"1m": 1440, "5m": 288, "15m": 96,
-                                        "1h": 24, "4h": 6, "1d": 1}.get(args.timeframe, 24)
-                        notional = risk_mgr.vol_target_size(
-                            balance["total"], df["close"], bars_per_day=bars_per_day,
-                        )
-                    if notional <= 0:
-                        notional = risk_mgr.atr_based_size(balance["total"], entry_price, atr)
-
-                    notional = risk_mgr.scale_by_confidence(notional, decision.get("confidence", 0.5))
-
-                    # Apply regime size modifier (uses blended regime with AI bias)
-                    regime_mod = risk_mgr.regime_size_modifier(blended, decision["action"])
-                    notional *= regime_mod
-
-                    # Funding-rate filter (perps only — spot exchanges return 0.0).
-                    # Extreme adverse funding → shrink or skip the trade.
-                    if settings.FUNDING_ENABLED:
-                        try:
-                            rate_1h = exchange.get_funding_rate(symbol)
-                        except Exception as e:
-                            logger.debug(f"funding lookup failed for {symbol}: {e}")
-                            rate_1h = 0.0
-                        fdec = evaluate_funding(
-                            rate_1h,
-                            decision["action"].upper(),
-                            extreme_annual=settings.FUNDING_EXTREME_ANNUAL,
-                            skip_annual=settings.FUNDING_SKIP_ANNUAL,
-                        )
-                        if fdec.action != "allow":
-                            logger.info(f"  FUNDING {symbol}: {fdec.action} — {fdec.reason}")
-                        notional *= fdec.size_modifier
-                        if fdec.action == "skip":
-                            logger.info(f"  SKIP {symbol}: funding filter (annual={fdec.annualized*100:.1f}%)")
-                            continue
-
-                    # Pre-trade risk checks
-                    current_positions = exchange.get_positions()
-                    allowed, reason = risk_mgr.pre_trade_check(
-                        decision["action"], current_positions, balance, notional, symbol=symbol,
-                    )
-
-                    if not allowed:
-                        logger.info(f"  RISK BLOCKED {symbol}: {reason}")
-                    else:
-                        amount = notional / entry_price
-                        if amount > 0:
-                            # Calculate SL and TP
-                            sl = risk_mgr.calculate_stop_loss(entry_price, decision["action"], atr)
-                            sl_distance = abs(entry_price - sl)
-                            tp = risk_mgr.calculate_take_profit(entry_price, decision["action"], 2.0, sl_distance)
-                            risk_pct = (notional / balance["total"]) * 100 if balance["total"] > 0 else 0
-
-                            # Execute entry + SL/TP in one call
-                            entry_order, _, _ = exchange.place_order_with_sl_tp(
-                                symbol, decision["action"], amount, entry_price, sl, tp,
-                            )
-
-                            if entry_order.status in ("filled", "open"):
-                                # Send detailed trade alert
-                                telegram.send_trade_alert(
-                                    side=decision["action"],
-                                    symbol=symbol,
-                                    price=entry_price,
-                                    amount=amount,
-                                    sl=sl,
-                                    confidence=decision.get("confidence", 0),
-                                    reasoning=decision.get("reasoning", ""),
-                                    indicators=signal.technical.indicators,
-                                    sentiment_summary=signal.sentiment.summary,
-                                    sentiment=signal.sentiment.sentiment.value,
-                                    sentiment_confidence=signal.sentiment.confidence,
-                                    risk_pct=risk_pct,
-                                    notional=notional,
-                                    tech_signal=signal.technical.signal.value,
-                                    tech_strength=signal.technical.strength,
-                                )
-
-                                journal.log_entry(
-                                    symbol=symbol,
-                                    side=decision["action"],
-                                    price=entry_price,
-                                    amount=amount,
-                                    confidence=decision.get("confidence", 0),
-                                    reasoning=decision.get("reasoning", ""),
-                                    indicators=signal.technical.indicators,
-                                    sentiment=signal.sentiment.sentiment.value,
-                                )
-
-                                # Register trailing-stop state so subsequent
-                                # cycles can tighten the SL as profit grows.
-                                from src.exchanges.base import Position as _Pos
-                                trailing_mgr.register(
-                                    _Pos(symbol=symbol, side=decision["action"],
-                                         size=amount, entry_price=entry_price, unrealized_pnl=0.0),
-                                    initial_sl=sl, tp=tp, atr=atr,
-                                )
-
-                # Live price display
+                # Live price display — shown every cycle regardless of gate outcome
                 live_price = price_stream.get_price(symbol)
                 if live_price:
-                    print(f"  [{symbol}] ${live_price:.2f} | Signal: {signal.action.value} | AI: {decision['action']} | Regime: {regime.regime.value}", flush=True)
+                    print(
+                        f"  [{symbol}] ${live_price:.2f} | Signal: {signal_action} | "
+                        f"AI: {ai_action} | Regime: {regime.regime.value}",
+                        flush=True,
+                    )
+
+                ai_veto_threshold = float(getattr(settings, "AI_VETO_MIN_CONFIDENCE", 0.80))
+
+                # --- Entry gate (pure decision function, see src/execution/gate.py) ---
+                gate = evaluate_entry_gate(
+                    signal_action=signal_action,
+                    signal_conf=signal_conf,
+                    ai_action=ai_action,
+                    ai_conf=ai_conf,
+                    min_confidence=min_confidence,
+                    ai_veto_threshold=ai_veto_threshold,
+                )
+                if not gate.allowed:
+                    rejection_stats[symbol][gate.reason] += 1
+                    if gate.reason == "signal_hold":
+                        logger.info(
+                            f"  [{symbol}] REJECT=signal_hold — combined={signal_action} "
+                            f"tech={signal.technical.signal.value}(str={signal.technical.strength:.2f}) "
+                            f"sent={signal.sentiment.sentiment.value} "
+                            f"regime={blended.regime.value}"
+                        )
+                    elif gate.reason == "low_confidence":
+                        logger.info(
+                            f"  [{symbol}] REJECT=low_confidence — "
+                            f"signal_conf={signal_conf:.2f} < min={min_confidence}"
+                        )
+                    elif gate.reason == "ai_veto_hold":
+                        logger.info(
+                            f"  [{symbol}] REJECT=ai_veto_hold — AI HOLD at conf={ai_conf:.2f} "
+                            f">= veto_threshold={ai_veto_threshold:.2f}"
+                        )
+                    elif gate.reason == "ai_veto_opposite":
+                        logger.info(
+                            f"  [{symbol}] REJECT=ai_veto_opposite — AI={ai_action} "
+                            f"vs signal={signal_action} (AI conf={ai_conf:.2f} >= {ai_veto_threshold:.2f})"
+                        )
+                    else:
+                        logger.info(f"  [{symbol}] REJECT={gate.reason}")
+                    continue
+
+                # All direction/confidence gates passed — signal wins.
+                trade_action = signal_action
+                trade_confidence = signal_conf
+
+                # --- Gate 3c: macro-event blackout ---
+                # High-impact USD macro events (FOMC, CPI, NFP, …) dry up
+                # liquidity and blow spreads 5–10× in the minutes before
+                # print. Reject new entries inside the blackout window;
+                # existing positions keep their SL/TP and trailing
+                # management so the bot can still *exit* around the event.
+                if (
+                    getattr(settings, "ECON_CALENDAR_ENABLED", False)
+                    and calendar_snapshot is not None
+                ):
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        ev_gate = evaluate_event_gate(
+                            now=_dt.now(_tz.utc),
+                            events=calendar_snapshot.events,
+                            blackout_min=int(settings.ECON_BLACKOUT_MIN),
+                            currencies=settings.ECON_TRACK_CURRENCIES,
+                            impacts=settings.ECON_TRACK_IMPACT,
+                        )
+                        if not ev_gate.allowed:
+                            rejection_stats[symbol]["event_blackout"] += 1
+                            logger.info(
+                                f"  [{symbol}] REJECT=event_blackout — {ev_gate.detail}"
+                            )
+                            continue
+                    except Exception as e:
+                        logger.debug(f"event gate failed (non-fatal): {e}")
+
+                entry_price = df["close"].iloc[-1]
+                atr = signal.technical.indicators.get("atr", 0)
+
+                # Volatility-targeting sizing (preferred) with ATR fallback.
+                # Vol-target keeps expected daily P&L roughly constant across
+                # symbols; ATR sizing is kept as a graceful fallback.
+                notional = 0.0
+                if settings.VOL_TARGET_ENABLED:
+                    bars_per_day = {"1m": 1440, "5m": 288, "15m": 96,
+                                    "1h": 24, "4h": 6, "1d": 1}.get(args.timeframe, 24)
+                    notional = risk_mgr.vol_target_size(
+                        balance["total"], df["close"], bars_per_day=bars_per_day,
+                    )
+                if notional <= 0:
+                    notional = risk_mgr.atr_based_size(balance["total"], entry_price, atr)
+
+                # Sizing uses signal confidence (primary). Blend AI conf if AI
+                # agrees with direction — gives slight boost when tech+AI align.
+                sizing_conf = trade_confidence
+                if ai_action == trade_action and ai_conf > 0:
+                    sizing_conf = 0.6 * trade_confidence + 0.4 * ai_conf
+                notional = risk_mgr.scale_by_confidence(notional, sizing_conf)
+
+                # Apply regime size modifier (uses blended regime with AI bias)
+                regime_mod = risk_mgr.regime_size_modifier(blended, trade_action)
+                notional *= regime_mod
+
+                # Chop trades are mean-reverting fades — shrink the size
+                # because win rate is lower and we want risk parity with
+                # the higher-RR trend trades.
+                if signal.strategy_mode == "chop":
+                    chop_mult = float(getattr(settings, "CHOP_SIZE_MULT", 0.5))
+                    notional *= chop_mult
+                    logger.info(f"  [{symbol}] chop sizing x{chop_mult}")
+
+                # Macro-event size modifier — shrink notional ±ECON_EVENT_WINDOW_H
+                # hours around any matching high-impact event. Applies OUTSIDE
+                # the blackout window (blackout already rejected entries inside
+                # T-ECON_BLACKOUT_MIN). Rationale: even 90 min after an event
+                # the tape can be whippy, so keep size small but don't refuse
+                # otherwise-valid setups.
+                if (
+                    getattr(settings, "ECON_CALENDAR_ENABLED", False)
+                    and calendar_snapshot is not None
+                ):
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        from src.strategy.econ_calendar import get_size_modifier as _cal_size
+                        ev_mult, ev_match = _cal_size(
+                            now=_dt.now(_tz.utc),
+                            events=calendar_snapshot.events,
+                            window_h=float(settings.ECON_EVENT_WINDOW_H),
+                            size_mult=float(settings.ECON_EVENT_SIZE_MULT),
+                            currencies=settings.ECON_TRACK_CURRENCIES,
+                            impacts=settings.ECON_TRACK_IMPACT,
+                        )
+                        if ev_mult != 1.0:
+                            notional *= ev_mult
+                            logger.info(
+                                f"  [{symbol}] event sizing x{ev_mult:.2f} "
+                                f"({ev_match.currency} {ev_match.title})"
+                            )
+                    except Exception as e:
+                        logger.debug(f"event size modifier failed (non-fatal): {e}")
+
+                # Funding-rate filter (perps only — spot exchanges return 0.0).
+                if settings.FUNDING_ENABLED:
+                    try:
+                        rate_1h = exchange.get_funding_rate(symbol)
+                    except Exception as e:
+                        logger.debug(f"funding lookup failed for {symbol}: {e}")
+                        rate_1h = 0.0
+                    fdec = evaluate_funding(
+                        rate_1h,
+                        trade_action.upper(),
+                        extreme_annual=settings.FUNDING_EXTREME_ANNUAL,
+                        skip_annual=settings.FUNDING_SKIP_ANNUAL,
+                    )
+                    if fdec.action != "allow":
+                        logger.info(f"  FUNDING {symbol}: {fdec.action} — {fdec.reason}")
+                    notional *= fdec.size_modifier
+                    if fdec.action == "skip":
+                        rejection_stats[symbol]["funding_skip"] += 1
+                        logger.info(
+                            f"  [{symbol}] REJECT=funding_skip — "
+                            f"annual={fdec.annualized*100:.1f}% ({fdec.reason})"
+                        )
+                        continue
+
+                # --- Gate 4: pre-trade risk checks (exposure, cluster, etc.) ---
+                current_positions = exchange.get_positions()
+                allowed, reason = risk_mgr.pre_trade_check(
+                    trade_action, current_positions, balance, notional, symbol=symbol,
+                )
+                if not allowed:
+                    rejection_stats[symbol]["risk_blocked"] += 1
+                    logger.info(f"  [{symbol}] REJECT=risk_blocked — {reason}")
+                    continue
+
+                # --- Gate 5: sizing sanity (after all modifiers) ---
+                amount = notional / entry_price if entry_price > 0 else 0.0
+                if amount <= 0:
+                    rejection_stats[symbol]["sizing_zero"] += 1
+                    logger.info(
+                        f"  [{symbol}] REJECT=sizing_zero — notional={notional:.2f} "
+                        f"entry={entry_price:.2f} (all modifiers collapsed size)"
+                    )
+                    continue
+
+                # Calculate SL and TP — chop trades prefer the engine's
+                # channel-edge hints (tighter stop, midline target); trend
+                # trades use the ATR-based defaults.
+                if signal.strategy_mode == "chop" and signal.chop is not None \
+                        and signal.chop.sl_hint is not None \
+                        and signal.chop.tp_hint is not None:
+                    sl = float(signal.chop.sl_hint)
+                    tp = float(signal.chop.tp_hint)
+                    sl_distance = abs(entry_price - sl)
+                else:
+                    sl = risk_mgr.calculate_stop_loss(entry_price, trade_action, atr)
+                    sl_distance = abs(entry_price - sl)
+                    tp = risk_mgr.calculate_take_profit(entry_price, trade_action, 2.0, sl_distance)
+                risk_pct = (notional / balance["total"]) * 100 if balance["total"] > 0 else 0
+
+                # Execute entry + SL/TP in one call.
+                # Pass typed OrderSide — the exchange layer also defensively
+                # normalizes strings, but pinning the enum at the boundary is
+                # the correct contract. See test_hyperliquid_side_norm.py.
+                side_enum = OrderSide.BUY if trade_action == "buy" else OrderSide.SELL
+                try:
+                    entry_order, _, _ = exchange.place_order_with_sl_tp(
+                        symbol, side_enum, amount, entry_price, sl, tp,
+                    )
+                except Exception as e:
+                    rejection_stats[symbol]["order_exception"] += 1
+                    logger.error(f"  [{symbol}] REJECT=order_exception — {e}")
+                    telegram.send_error_alert(f"Order failed {symbol}: {e}")
+                    continue
+
+                if entry_order.status not in ("filled", "open"):
+                    rejection_stats[symbol]["order_failed"] += 1
+                    logger.warning(
+                        f"  [{symbol}] REJECT=order_failed — "
+                        f"status={entry_order.status} id={entry_order.id}"
+                    )
+                    continue
+
+                executed_count += 1
+
+                # Build extra reasoning tags: strategy mode (trend/chop) +
+                # condensed levels summary so Telegram recipients know
+                # whether a trade was a trend follow-through or a chop fade,
+                # and which pivot gave the bias.
+                extra_reasoning_parts = [
+                    f"[{signal.strategy_mode}]",
+                    decision.get("reasoning", ""),
+                ]
+                if signal.levels is not None:
+                    extra_reasoning_parts.append(f"Levels: {signal.levels.reasoning}")
+                trade_reasoning = " | ".join(p for p in extra_reasoning_parts if p)
+
+                # Send detailed trade alert
+                telegram.send_trade_alert(
+                    side=trade_action,
+                    symbol=symbol,
+                    price=entry_price,
+                    amount=amount,
+                    sl=sl,
+                    confidence=trade_confidence,
+                    reasoning=trade_reasoning,
+                    indicators=signal.technical.indicators,
+                    sentiment_summary=signal.sentiment.summary,
+                    sentiment=signal.sentiment.sentiment.value,
+                    sentiment_confidence=signal.sentiment.confidence,
+                    risk_pct=risk_pct,
+                    notional=notional,
+                    tech_signal=signal.technical.signal.value,
+                    tech_strength=signal.technical.strength,
+                    strategy_mode=signal.strategy_mode,
+                )
+
+                journal.log_entry(
+                    symbol=symbol,
+                    side=trade_action,
+                    price=entry_price,
+                    amount=amount,
+                    confidence=trade_confidence,
+                    reasoning=decision.get("reasoning", ""),
+                    indicators=signal.technical.indicators,
+                    sentiment=signal.sentiment.sentiment.value,
+                )
+
+                # Register trailing-stop state so subsequent cycles
+                # can tighten the SL as profit grows.
+                from src.exchanges.base import Position as _Pos
+                trailing_mgr.register(
+                    _Pos(symbol=symbol, side=trade_action,
+                         size=amount, entry_price=entry_price, unrealized_pnl=0.0),
+                    initial_sl=sl, tp=tp, atr=atr,
+                )
+
+                logger.info(f"  [{symbol}] EXECUTED {trade_action.upper()} size={amount:.6f} @ {entry_price:.4f}")
+
+            # === Per-cycle summary ===
+            # Dumps aggregate rejection stats so ops can see at a glance
+            # WHY trades aren't happening across the pair universe.
+            total_rejected = sum(sum(r.values()) for r in rejection_stats.values())
+            logger.info(
+                f"=== Cycle summary: executed={executed_count} rejected={total_rejected} "
+                f"pairs={len(settings.TRADING_PAIRS)} ==="
+            )
+            reason_totals: dict[str, int] = defaultdict(int)
+            if total_rejected > 0:
+                # Flatten to {reason: total_count} for the headline
+                for sym_stats in rejection_stats.values():
+                    for reason, cnt in sym_stats.items():
+                        reason_totals[reason] += cnt
+                summary = ", ".join(f"{k}={v}" for k, v in sorted(reason_totals.items()))
+                logger.info(f"  Rejection breakdown: {summary}")
+                # Per-symbol detail (quiet for symbols with no rejections)
+                for sym in sorted(rejection_stats.keys()):
+                    per_sym = rejection_stats[sym]
+                    if not per_sym:
+                        continue
+                    detail = ", ".join(f"{k}={v}" for k, v in sorted(per_sym.items()))
+                    logger.info(f"    [{sym}] {detail}")
+
+            # === Periodic Telegram digest ===
+            # Every TELEGRAM_DIGEST_INTERVAL_CYCLES cycles, push a compact
+            # rollup so Telegram-only operators can see at a glance what
+            # the loop has been doing even if no trades fired. Pulls
+            # Tavily budget state too since that silently gates sentiment.
+            try:
+                digest_every = int(getattr(settings, "TELEGRAM_DIGEST_INTERVAL_CYCLES", 12))
+            except Exception:
+                digest_every = 12
+            if digest_every > 0 and (cycle_counter % digest_every == 0):
+                try:
+                    budget_snapshot = None
+                    try:
+                        from src.strategy.sentiment_cache import get_budget_snapshot
+                        budget_snapshot = get_budget_snapshot()
+                    except Exception as e:
+                        logger.debug(f"budget snapshot failed: {e}")
+                    telegram.send_cycle_digest(
+                        cycle_num=cycle_counter,
+                        executed=executed_count,
+                        rejected=total_rejected,
+                        rejection_breakdown=dict(reason_totals),
+                        pairs=[p.strip() for p in settings.TRADING_PAIRS],
+                        budget_snapshot=budget_snapshot,
+                    )
+                except Exception as e:
+                    logger.warning(f"Telegram cycle digest failed: {e}")
 
             if getattr(args, "once", False):
                 logger.info("Single-cycle mode (--once) — exiting after one pass.")
@@ -602,104 +986,38 @@ def cmd_walkforward(args):
     print(f"  OOS Trades       : {len(report.combined_trades)}")
     print(f"{'='*60}")
     if report.folds:
-        print(f"\n  {'#':<3} {'Test Window':<36} {'Trades':<7} {'WR%':<6} {'PnL%':<8} {'Best Params'}")
-        print(f"  {'-'*100}")
-        for f in report.folds:
-            tr = f.test_result
+        print(f"  Per-fold OOS PnL:")
+        for fold in report.folds:
+            tr = fold.test_result
+            pnl_sign = "+" if tr.total_pnl >= 0 else ""
             print(
-                f"  {f.idx:<3} {f.test_start[:16]} -> {f.test_end[:16]}  "
-                f"{tr.total_trades:<7} {tr.win_rate:<6.1f} {tr.total_pnl_pct:<+8.2f} {f.best_params}"
+                f"    Fold {fold.idx:>2}: "
+                f"{fold.test_start[:10]} → {fold.test_end[:10]}  "
+                f"{pnl_sign}{tr.total_pnl:>7.2f} USDT  "
+                f"({pnl_sign}{tr.total_pnl_pct:>5.2f}%)  "
+                f"trades={len(tr.trades):>3}  "
+                f"params={fold.best_params}"
             )
+        print(f"{'='*60}")
     print()
 
 
-def fetch_ohlcv_df_from_raw(raw: list):
-    """Convert raw OHLCV list to DataFrame."""
-    import pandas as pd
-    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df.set_index("timestamp", inplace=True)
-    return df
-
-
-def cmd_export(args):
-    """Export the trade journal to a formatted .xlsx workbook."""
-    from src.utils.trade_export import export_trades_to_xlsx
-
-    out = args.output
-    if not out:
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        suffix = f"-last{args.days}d" if args.days else ""
-        out = f"data/trade_export-{ts}{suffix}.xlsx"
-
-    try:
-        stats = export_trades_to_xlsx(out, days=args.days)
-    except Exception as e:
-        logger.error(f"Export failed: {e}")
-        print(f"[ERROR] Export failed: {e}")
-        return
-
-    print("\n=== Trade Journal Export ===")
-    print(f"  File     : {stats['path']}")
-    print(f"  Rows     : {stats['rows']} (closed: {stats['closed']}, open: {stats['open']})")
-    if args.days:
-        print(f"  Window   : last {args.days} day(s)")
-    print(f"  Sheets   : Trades | Summary | By Symbol | Daily P&L")
-    print("\nOpen the file in Excel/LibreOffice. Formulas recalculate automatically")
-    print("on first open — no manual recalc needed.\n")
-
-
-def generate_synthetic_data(symbol: str, limit: int = 500):
-    """Generate realistic synthetic OHLCV data for backtesting."""
-    import numpy as np
-    import pandas as pd
-
-    # Set base price based on symbol
-    base_prices = {"BTC/USDT": 80000, "ETH/USDT": 3000, "SOL/USDT": 150}
-    base_price = base_prices.get(symbol, 100)
-
-    np.random.seed(42)
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=limit, freq="1h")
-
-    # Random walk with trend cycles
-    returns = np.random.normal(0.0001, 0.012, limit)
-    # Add trend cycles (sinusoidal)
-    trend = np.sin(np.linspace(0, 8 * np.pi, limit)) * 0.002
-    returns += trend
-
-    close = base_price * np.exp(np.cumsum(returns))
-    high = close * (1 + np.abs(np.random.normal(0, 0.005, limit)))
-    low = close * (1 - np.abs(np.random.normal(0, 0.005, limit)))
-    open_prices = close * (1 + np.random.normal(0, 0.003, limit))
-    volume = np.random.uniform(100, 5000, limit)
-
-    df = pd.DataFrame({
-        "open": open_prices,
-        "high": high,
-        "low": low,
-        "close": close,
-        "volume": volume,
-    }, index=dates)
-    return df
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Agentic Trade - AI Trading Bot")
+    """CLI entry point — dispatches to cmd_* handlers via argparse."""
+    parser = argparse.ArgumentParser(description="Agentic Trade — AI crypto trading bot")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # run command
-    run_parser = subparsers.add_parser("run", help="Start the trading bot")
-    run_parser.add_argument("--exchange", default=settings.DEFAULT_EXCHANGE, choices=["binance", "hyperliquid"])
-    run_parser.add_argument("--timeframe", default="1h", help="Candle timeframe (1m, 5m, 15m, 1h, 4h, 1d)")
-    run_parser.add_argument("--interval", type=int, default=300, help="Seconds between analysis cycles")
-    run_parser.add_argument("--min-confidence", type=float, default=0.5, help="Minimum confidence to execute trades")
-    run_parser.add_argument("--once", action="store_true",
-                            help="Run one cycle then exit (for Task Scheduler / cron wrappers).")
+    run_parser = subparsers.add_parser("run", help="Start the trading bot (live loop)")
+    run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Skip order placement — log decisions only",
+    )
     run_parser.set_defaults(func=cmd_run)
 
     # status command
     status_parser = subparsers.add_parser("status", help="Show positions and balance")
-    status_parser.add_argument("--exchange", default=settings.DEFAULT_EXCHANGE, choices=["binance", "hyperliquid"])
     status_parser.set_defaults(func=cmd_status)
 
     # backtest command
@@ -743,34 +1061,22 @@ def main():
     )
     wf_parser.add_argument("--symbol", default="BTC/USDT")
     wf_parser.add_argument("--timeframe", default="1h")
-    wf_parser.add_argument("--limit", type=int, default=2000, help="Total candles to fetch (needs >= train+test)")
+    wf_parser.add_argument(
+        "--limit", type=int, default=2000,
+        help="Total candles to fetch (needs >= train+test)",
+    )
     wf_parser.add_argument("--balance", type=float, default=50.0)
     wf_parser.add_argument("--leverage", type=float, default=20.0)
     wf_parser.add_argument("--risk", type=float, default=2.0)
     wf_parser.add_argument("--train-window", type=int, default=500)
     wf_parser.add_argument("--test-window", type=int, default=200)
-    wf_parser.add_argument("--step", type=int, default=None, help="Defaults to test window (non-overlapping)")
+    wf_parser.add_argument(
+        "--step", type=int, default=None,
+        help="Defaults to test window (non-overlapping)",
+    )
     wf_parser.add_argument("--sentiment", action="store_true")
     wf_parser.add_argument("--allow-synthetic", action="store_true")
     wf_parser.set_defaults(func=cmd_walkforward)
-
-    # export command — dump data/trades.json to a formatted xlsx workbook
-    export_parser = subparsers.add_parser(
-        "export",
-        help="Export the trade journal to a formatted .xlsx workbook",
-    )
-    export_parser.add_argument(
-        "--output", "-o",
-        default=None,
-        help="Output xlsx path (default: data/trade_export-<timestamp>.xlsx)",
-    )
-    export_parser.add_argument(
-        "--days",
-        type=int,
-        default=None,
-        help="Only include trades opened in the last N days (default: all)",
-    )
-    export_parser.set_defaults(func=cmd_export)
 
     args = parser.parse_args()
     if not args.command:

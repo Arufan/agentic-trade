@@ -24,6 +24,7 @@ from enum import Enum
 from tavily import TavilyClient
 
 from config import settings
+from src.strategy.sentiment_cache import cached_tavily_search
 from src.utils.logger import logger
 
 
@@ -61,7 +62,13 @@ def _try_tavily_search(api_key: str, query: str) -> dict | None:
 
 
 def _fetch_news(query: str) -> dict | None:
-    """Primary → backup Tavily key, return raw result dict or None."""
+    """Primary → backup Tavily key, return raw result dict or None.
+
+    Wrapped by ``cached_tavily_search`` which (a) serves repeat queries
+    from a TTL cache (default 90 min), and (b) enforces a monthly
+    budget circuit-breaker so we never burn through the 2000-credit
+    Tavily plan during normal operation.
+    """
     primary = settings.TAVILY_API_KEY
     backup = settings.TAVILY_API_KEY_BACKUP
 
@@ -69,13 +76,21 @@ def _fetch_news(query: str) -> dict | None:
         logger.info("Tavily key not set, sentiment will be NEUTRAL")
         return None
 
-    results = None
-    if primary:
-        results = _try_tavily_search(primary, query)
-    if results is None and backup:
-        logger.info("Falling back to backup Tavily API key")
-        results = _try_tavily_search(backup, query)
-    return results
+    def _do_fetch() -> dict | None:
+        results = None
+        if primary:
+            results = _try_tavily_search(primary, query)
+        if results is None and backup:
+            logger.info("Falling back to backup Tavily API key")
+            results = _try_tavily_search(backup, query)
+        return results
+
+    result, status = cached_tavily_search(query, _do_fetch)
+    # Only log miss/budget/network at info; cache hits are silent to keep
+    # the log volume manageable.
+    if status != "hit":
+        logger.info(f"Tavily fetch for '{query}': {status}")
+    return result
 
 
 # --------------------------------------------------------------------------- #

@@ -11,6 +11,8 @@ from src.strategy.regime import (
     detect_regime, blend_regimes,
 )
 from src.strategy.alpha import CombinedAlpha
+from src.strategy.chop import ChopResult, evaluate_chop
+from src.strategy.levels import KeyLevelResult
 from src.utils.logger import logger
 
 
@@ -24,6 +26,16 @@ class CombinedSignal:
     blended_regime: BlendedRegimeResult | None
     alpha: Optional[CombinedAlpha]
     reasoning: str
+    # Higher-TF key-levels summary. Optional — backtests / tests may
+    # skip the daily-fetch plumbing. When present, the engine's
+    # bias_score nudges the combined score BEFORE the ±0.3 threshold.
+    levels: Optional[KeyLevelResult] = None
+    # Strategy mode tells the live loop WHY this signal fired:
+    #   "trend" — default trend-follow blend
+    #   "chop"  — mean-reversion fallback in sideways regime
+    # The live loop uses this to apply chop-specific sizing + SL/TP hints.
+    strategy_mode: str = "trend"
+    chop: Optional[ChopResult] = None
 
 
 def generate_signal(
@@ -35,6 +47,8 @@ def generate_signal(
     sent_weight: float | None = None,
     alpha_weight: float | None = None,
     alpha: Optional[CombinedAlpha] = None,
+    levels: Optional[KeyLevelResult] = None,
+    levels_weight: float | None = None,
 ) -> CombinedSignal:
     """Combine technical, sentiment, regime, and alpha analysis into a final signal.
 
@@ -93,10 +107,20 @@ def generate_signal(
 
     alpha_score = alpha.score if alpha is not None else 0.0
 
+    # Key-levels contribute a bounded ±1 bias that nudges the combined
+    # score toward bounce-off-support / reject-at-resistance setups. The
+    # default weight (0.1) is modest — levels confirm, they don't drive.
+    if levels_weight is None:
+        levels_weight = float(getattr(settings, "LEVELS_WEIGHT", 0.10))
+    levels_weight = max(0.0, min(0.5, levels_weight))
+    levels_score = float(levels.bias_score) if levels is not None else 0.0
+    effective_levels_weight = levels_weight if levels is not None else 0.0
+
     combined = (
         tech_score * tech_weight
         + sent_score * sent_weight
         + alpha_score * effective_alpha_weight
+        + levels_score * effective_levels_weight
     )
 
     if combined >= 0.3:
@@ -133,16 +157,46 @@ def generate_signal(
 
     confidence = min(confidence, 1.0)
 
+    # --- Chop fallback: when the primary blend says HOLD and we're in a
+    # sideways regime, give the mean-reversion engine a chance to fire.
+    # This is the "edge handler" for chop that the live-test log showed
+    # we desperately need — 8k holds vs 0 trades otherwise.
+    chop_result: Optional[ChopResult] = None
+    strategy_mode = "trend"
+    chop_enabled = bool(getattr(settings, "CHOP_ENABLED", True))
+    is_sideways = regime == Regime.SIDEWAYS
+    if chop_enabled and is_sideways and action == Signal.HOLD:
+        try:
+            chop_min = float(getattr(settings, "CHOP_MIN_STRENGTH", 0.55))
+            chop_result = evaluate_chop(df, levels=levels, min_strength=chop_min)
+            if chop_result.is_tradable:
+                # Chop sizing is always smaller (handled in risk layer);
+                # confidence here reflects the chop strength directly.
+                action = chop_result.action
+                confidence = min(1.0, chop_result.strength)
+                strategy_mode = "chop"
+                logger.info(
+                    f"Chop fallback fired for {symbol}: {action.value} "
+                    f"strength={confidence:.2f} — {chop_result.reasoning}"
+                )
+        except Exception as e:
+            logger.warning(f"Chop evaluation failed for {symbol}: {e}")
+
     alpha_part = ""
     if alpha is not None:
         alpha_part = (
             f"Alpha: {alpha.action.value} (strength={alpha.strength:.2f} score={alpha.score:+.2f}), "
         )
 
+    levels_part = ""
+    if levels is not None:
+        levels_part = f"Levels: {levels.reasoning}, "
+
     reasoning = (
         f"Technical: {technical.signal.value} (strength={technical.strength:.2f}), "
         f"Sentiment: {sentiment.sentiment.value} (confidence={sentiment.confidence:.2f}), "
         f"{alpha_part}"
+        f"{levels_part}"
         f"Regime: {regime.value} (score={blended.confidence:.2f} vol={blended.volatility_score:.0%}), "
         f"AI bias: {blended.ai_bias.value}, "
         f"Combined score: {combined:.2f}"
@@ -164,4 +218,7 @@ def generate_signal(
         blended_regime=blended,
         alpha=alpha,
         reasoning=reasoning,
+        levels=levels,
+        strategy_mode=strategy_mode,
+        chop=chop_result,
     )

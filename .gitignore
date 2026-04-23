@@ -26,3 +26,12 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Local / cache
+data/
+tmp/
+.env.livetest
+.sync_sentinel.txt
+backtest_report.html
+pytest-cache-files-*/
+.openclaude/

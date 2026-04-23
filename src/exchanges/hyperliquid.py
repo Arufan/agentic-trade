@@ -212,6 +212,13 @@ class HyperliquidExchange(BaseExchange):
 
     def place_order(self, symbol: str, side: OrderSide, amount: float,
                     order_type: OrderType = OrderType.MARKET, price: float | None = None) -> Order:
+        # Defensive: accept both OrderSide enum and plain "buy"/"sell" strings.
+        # Historically a bug at the caller passed decision["action"] (str), which
+        # crashed at logger.info(f"{side.value}…") AFTER the order was already
+        # filled on the exchange — leaving an orphan position with no SL/TP and
+        # no journal entry. Normalize at the boundary to make this impossible.
+        if not isinstance(side, OrderSide):
+            side = OrderSide.BUY if str(side).lower() == "buy" else OrderSide.SELL
         coin = self._coin(symbol)
         asset = self._asset(symbol)
         is_buy = side == OrderSide.BUY
@@ -332,6 +339,8 @@ class HyperliquidExchange(BaseExchange):
         sl_price: float, tp_price: float, reference_price: float,
     ) -> dict:
         """Build the normalTpsl action payload for SL/TP reduce-only pair."""
+        if not isinstance(side, OrderSide):
+            side = OrderSide.BUY if str(side).lower() == "buy" else OrderSide.SELL
         coin = self._coin(symbol)
         asset = self._asset(symbol)
         is_long = side == OrderSide.BUY
@@ -412,6 +421,8 @@ class HyperliquidExchange(BaseExchange):
         Returns (entry_order, sl_price, tp_price).
         If entry fails, sl/tp will be None.
         """
+        if not isinstance(side, OrderSide):
+            side = OrderSide.BUY if str(side).lower() == "buy" else OrderSide.SELL
         # 1. Place entry order
         entry_order = self.place_order(symbol, side, amount, OrderType.MARKET)
         if entry_order.status not in ("filled", "open"):
